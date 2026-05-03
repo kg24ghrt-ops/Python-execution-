@@ -1,5 +1,12 @@
 # server.py
+"""
+WebSocket-based Python code execution server with sandboxing and security features.
+
+This server provides a secure environment for executing user-submitted Python code
+with resource limits, import restrictions, and filesystem sandboxing.
+"""
 from __future__ import annotations
+
 import asyncio
 import http
 import json
@@ -10,12 +17,13 @@ import shutil
 import signal
 import sys
 import tempfile
-from typing import Dict, Set, Optional, Tuple, List
+from dataclasses import dataclass, field
+from typing import Dict, Set, Optional, Tuple, List, Any
 
 import websockets
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION  (tuned for Hugging Face Free tier containers)
+# CONFIGURATION
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -24,29 +32,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger("python-runner")
 
+# Session management limits (relaxed for daily use)
+MAX_CONCURRENT_SESSIONS = 20
+MAX_SESSIONS_PER_WS = 10
+EXEC_TIMEOUT = 600
+BACKPRESSURE_LIMIT = 500
+
+# File and payload limits
+MAX_FILES = 50
+MAX_FILENAME_LENGTH = 256
+SESSION_ID_MAX_LENGTH = 128
+MAX_TOTAL_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_PAYLOAD_EXTRA = 20_000
+MAX_WEBSOCKET_MESSAGE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+# Output flood protection (relaxed for daily use)
+MAX_OUTPUT_CHARS_PER_SEC = 200_000
+
+# Linux resource limits (sandbox) - relaxed for daily use
+SANDBOX_MEMORY_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB
+SANDBOX_CPU_SEC = 300
+SANDBOX_MAX_FDS = 200
+SANDBOX_MAX_PROCS = 50
+SANDBOX_MAX_FSIZE = 100 * 1024 * 1024       # 100 MB
+
+# Health check endpoints
+HEALTH_ENDPOINTS = {"/", "/health", "/healthz"}
+
+# Sentinel object for queue signaling
 SENTINEL = object()
-BACKPRESSURE_LIMIT = 200
-
-# Security / resource knobs
-MAX_CONCURRENT_SESSIONS = 5          # Global sessions
-MAX_SESSIONS_PER_WS = 2              # Per-connection sessions
-MAX_TOTAL_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GiB
-MAX_FILES = 20                       # Max files in one run
-EXEC_TIMEOUT = 300                   # Hard kill after N seconds
-MAX_OUTPUT_CHARS_PER_SEC = 50_000    # Rough flood-gate (enforced in dispatcher)
-
-# Sandbox limits (Linux only — HF uses Linux containers)
-SANDBOX_MEMORY_BYTES = 512 * 1024 * 1024   # 512 MB
-SANDBOX_CPU_SEC = 60                       # 60 sec CPU
-SANDBOX_MAX_FDS = 50
-SANDBOX_MAX_PROCS = 0                      # No fork bombs
-SANDBOX_MAX_FSIZE = 10 * 1024 * 1024       # 10 MB written files
 
 # ---------------------------------------------------------------------------
 # BOOTSTRAP INJECTED INTO EVERY USER PROCESS
 # ---------------------------------------------------------------------------
-# This restricts builtins, file access, imports, and patches input() so it
-# signals the server when a prompt is waiting.
 BOOTSTRAP_TEMPLATE = r'''
 import os, sys, builtins, importlib.abc, importlib.machinery, runpy
 
@@ -68,22 +86,18 @@ def _restricted_open(file, mode='r', *args, **kwargs):
 
 builtins.open = _restricted_open
 
-# ----- Disable code-evaluation builtins -----
-for _name in ('exec', 'eval', 'compile'):
-    if hasattr(builtins, _name):
-        def _make_disabled(n):
-            return lambda *a, **k: (_ for _ in ()).throw(PermissionError(n + " is disabled"))
-        setattr(builtins, _name, _make_disabled(_name))
-
 # ----- Notify server when input() is called -----
-_input_signal = int(os.environ.get('__INPUT_SIGNAL_FD', -1))
+_input_signal_fd = int(os.environ.get('__INPUT_SIGNAL_FD', -1))
+_input_signaled = False
 
 def _notifying_input(prompt=''):
+    global _input_signaled
     if prompt:
         print(prompt, end='', flush=True)
-    if _input_signal >= 0:
+    if _input_signal_fd >= 0 and not _input_signaled:
+        _input_signaled = True
         try:
-            os.write(_input_signal, b'1')
+            os.write(_input_signal_fd, b'1')
         except OSError:
             pass
     return sys.stdin.readline().rstrip('\n')
@@ -118,18 +132,18 @@ def _restricted_os_open(path, flags, mode=0o777, *args, **kwargs):
 _os_mod.open = _restricted_os_open
 
 # ----- Import restrictions -----
-_dangerous = {
+_dangerous_modules = {
     'subprocess', 'socket', 'ctypes', 'multiprocessing',
     'asyncio.subprocess', 'shutil', 'pty', 'shlex'
 }
 for _attr in _restricted_os_attrs:
-    _dangerous.add('os.' + _attr)
+    _dangerous_modules.add('os.' + _attr)
 
 class _RestrictedFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname in _dangerous:
+        if fullname in _dangerous_modules:
             raise ImportError("Import of " + fullname + " is restricted")
-        for d in _dangerous:
+        for d in _dangerous_modules:
             if fullname.startswith(d + '.'):
                 raise ImportError("Import of " + fullname + " is restricted")
         return None
@@ -149,28 +163,33 @@ runpy.run_path(_entrypoint, run_name='__main__')
 '''
 
 # ---------------------------------------------------------------------------
-# HELPERS
+# DATA CLASSES AND GLOBAL STATE
 # ---------------------------------------------------------------------------
-active_sessions: Dict[str, "Session"] = {}
+@dataclass
+class Session:
+    """Represents an active code execution session."""
+    id: str
+    ws: websockets.ServerConnection
+    sandbox: str
+    signal_r: int
+    proc: Optional[asyncio.subprocess.Process] = None
+    tasks: List[asyncio.Task] = field(default_factory=list)
+    stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=BACKPRESSURE_LIMIT))
+    state: str = "RUNNING"
+    output_chars: int = 0
+
+
+# Global session tracking
+active_sessions: Dict[str, Session] = {}
 connection_sessions: Dict[websockets.ServerConnection, Set[str]] = {}
 
 
-class Session:
-    def __init__(self, session_id: str, ws: websockets.ServerConnection, sandbox: str, signal_r: int):
-        self.id = session_id
-        self.ws = ws
-        self.sandbox = sandbox
-        self.signal_r = signal_r
-        self.proc: Optional[asyncio.subprocess.Process] = None
-        self.tasks: list[asyncio.Task] = []
-        self.stdin_lock = asyncio.Lock()
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=BACKPRESSURE_LIMIT)
-        self.state: str = "RUNNING"
-        self.output_chars = 0
-
-
 def _set_resource_limits():
-    """Called in child process before exec (Linux only)."""
+    """Set Linux resource limits for sandboxed execution.
+    
+    Called in child process before exec (Linux only).
+    """
     try:
         import resource
         resource.setrlimit(resource.RLIMIT_AS, (SANDBOX_MEMORY_BYTES, SANDBOX_MEMORY_BYTES))
@@ -179,15 +198,20 @@ def _set_resource_limits():
         resource.setrlimit(resource.RLIMIT_NPROC, (SANDBOX_MAX_PROCS, SANDBOX_MAX_PROCS))
         resource.setrlimit(resource.RLIMIT_FSIZE, (SANDBOX_MAX_FSIZE, SANDBOX_MAX_FSIZE))
     except Exception:
-        pass
+        pass  # Ignore on non-Unix systems
 
 
 def _sanitize_session_id(sid: str) -> bool:
-    return bool(re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', sid))
+    """Validate session ID format."""
+    return bool(re.fullmatch(r'[a-zA-Z0-9_-]{1,' + str(SESSION_ID_MAX_LENGTH) + r'}', sid))
 
 
 def _sanitize_filename(name: str) -> Optional[str]:
-    if not name or len(name) > 128:
+    """Sanitize and validate filename for security.
+    
+    Returns sanitized name or None if invalid.
+    """
+    if not name or len(name) > MAX_FILENAME_LENGTH:
         return None
     if re.search(r'[^\w.\-/]', name):
         return None
@@ -197,6 +221,7 @@ def _sanitize_filename(name: str) -> Optional[str]:
 
 
 async def _send_safe(ws: websockets.ServerConnection, payload: dict):
+    """Send message to websocket, ignoring connection errors."""
     try:
         await ws.send(json.dumps(payload))
     except websockets.exceptions.ConnectionClosed:
@@ -204,14 +229,20 @@ async def _send_safe(ws: websockets.ServerConnection, payload: dict):
 
 
 async def _cleanup_session(session: Session):
+    """Clean up all resources associated with a session.
+    
+    Cancels tasks, terminates process, closes file descriptors, and removes sandbox.
+    """
     if session.state == "CLEANING":
         return
     session.state = "CLEANING"
 
+    # Cancel all running tasks
     for task in session.tasks:
         task.cancel()
     await asyncio.gather(*session.tasks, return_exceptions=True)
 
+    # Terminate process if still running
     if session.proc and session.proc.returncode is None:
         session.proc.terminate()
         try:
@@ -229,7 +260,7 @@ async def _cleanup_session(session: Session):
     except OSError:
         pass
 
-    # Remove sandbox
+    # Remove sandbox directory
     try:
         shutil.rmtree(session.sandbox, ignore_errors=True)
     except Exception:
@@ -239,6 +270,7 @@ async def _cleanup_session(session: Session):
 
 
 async def _stream_pipe(pipe, queue: asyncio.Queue, msg_type: str, session_id: str):
+    """Stream output from a pipe to the message queue."""
     try:
         while True:
             chunk = await pipe.read(4096)
@@ -256,6 +288,10 @@ async def _stream_pipe(pipe, queue: asyncio.Queue, msg_type: str, session_id: st
 
 
 async def _output_dispatcher(queue: asyncio.Queue, ws: websockets.ServerConnection, session_id: str):
+    """Dispatch output messages from queue to websocket client.
+    
+    Implements flood protection by tracking output character count.
+    """
     try:
         pending_streams = 2
         while pending_streams > 0:
@@ -263,11 +299,13 @@ async def _output_dispatcher(queue: asyncio.Queue, ws: websockets.ServerConnecti
             if msg is SENTINEL:
                 pending_streams -= 1
                 continue
-            # Flood gate
+            
+            # Flood gate protection
             session = active_sessions.get(session_id)
             if session:
                 session.output_chars += len(msg.get("output", ""))
-                if session.output_chars > MAX_OUTPUT_CHARS_PER_SEC * EXEC_TIMEOUT:
+                max_chars = MAX_OUTPUT_CHARS_PER_SEC * EXEC_TIMEOUT
+                if session.output_chars > max_chars:
                     await _send_safe(ws, {
                         "type": "error",
                         "session_id": session_id,
@@ -283,33 +321,53 @@ async def _output_dispatcher(queue: asyncio.Queue, ws: websockets.ServerConnecti
 
 
 async def _watch_input_requests(fd: int, session_id: str, ws: websockets.ServerConnection):
-    """Reads the input-request pipe and tells the client to show a prompt."""
+    """Monitor input signal pipe and notify client when input is requested.
+    
+    Reads from a pipe that the sandboxed process writes to when input() is called.
+    Only sends one notification per input() call to avoid spam.
+    """
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
+    transport = None
     try:
-        transport, _ = await loop.connect_read_pipe(lambda: protocol, os.fdopen(fd, 'rb'))
-    except OSError:
+        pipe_fd = os.fdopen(fd, 'rb', buffering=0)
+        transport, _ = await loop.connect_read_pipe(
+            lambda: protocol, 
+            pipe_fd
+        )
+    except OSError as e:
+        logger.warning(f"Failed to set up input watcher for {session_id}: {e}")
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         return
+    
+    notified = False
     try:
         while True:
             data = await reader.read(1)
             if not data:
                 break
-            await _send_safe(ws, {
-                "type": "input_requested",
-                "session_id": session_id,
-                "message": "Waiting for input..."
-            })
+            if not notified:
+                notified = True
+                await _send_safe(ws, {
+                    "type": "input_requested",
+                    "session_id": session_id,
+                    "message": "Waiting for input..."
+                })
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.error(f"Input watcher error ({session_id}): {e}")
     finally:
-        transport.close()
+        if transport:
+            transport.close()
 
 
 async def _session_timeout(session: Session, timeout: float):
+    """Terminate session after timeout period."""
     try:
         await asyncio.sleep(timeout)
         if session.state == "RUNNING":
@@ -318,7 +376,7 @@ async def _session_timeout(session: Session, timeout: float):
                 "type": "error",
                 "session_id": session.id,
                 "message": f"Execution timed out after {timeout} seconds",
-                "is_timeout": True  # ✅ ADDED: Protocol-level timeout flag
+                "is_timeout": True
             })
             await _cleanup_session(session)
     except asyncio.CancelledError:
@@ -332,7 +390,16 @@ async def _run_session(
     session_id: str,
     ws: websockets.ServerConnection,
 ):
-    # --- overwrite existing session with same id ---
+    """Execute user code in a sandboxed environment.
+    
+    Args:
+        files: Dictionary of filename -> content for multi-file projects
+        code: Single file code content (used if files is None)
+        entrypoint: Main file to execute (defaults to main.py)
+        session_id: Unique session identifier
+        ws: WebSocket connection for communication
+    """
+    # Clean up existing session with same ID
     if existing := active_sessions.get(session_id):
         logger.info(f"Awaiting cleanup for session overwrite: {session_id}")
         await _cleanup_session(existing)
@@ -341,46 +408,47 @@ async def _run_session(
 
     logger.info(f"Starting session: {session_id}")
 
-    # --- build sandbox ---
+    # Create sandbox directory
     sandbox = tempfile.mkdtemp(prefix="pybox_")
 
-    # --- write user files ---
-    if files:
-        for name, content in files.items():
-            safe_name = _sanitize_filename(name)
-            if not safe_name:
-                continue
-            path = os.path.join(sandbox, safe_name)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-        entry = entrypoint or "main.py"
-    else:
-        entry = "main.py"
-        with open(os.path.join(sandbox, entry), "w", encoding="utf-8") as f:
-            f.write(code or "")
-
-    # --- write bootstrap ---
-    bootstrap_path = os.path.join(sandbox, "__runner__.py")
-    with open(bootstrap_path, "w", encoding="utf-8") as f:
-        f.write(BOOTSTRAP_TEMPLATE)
-
-    # --- input signal pipe ---
-    signal_r, signal_w = os.pipe()
-
-    # --- environment ---
-    env = os.environ.copy()
-    env["__INPUT_SIGNAL_FD"] = str(signal_w)
-    env["__SANDBOX_DIR"] = sandbox
-    env["__ENTRYPOINT"] = entry
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
-
-    session = Session(session_id, ws, sandbox, signal_r)
-    active_sessions[session_id] = session
-    connection_sessions.setdefault(ws, set()).add(session_id)
-
     try:
+        # Write user files to sandbox
+        if files:
+            for name, content in files.items():
+                safe_name = _sanitize_filename(name)
+                if not safe_name:
+                    continue
+                path = os.path.join(sandbox, safe_name)
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            entry = entrypoint or "main.py"
+        else:
+            entry = "main.py"
+            with open(os.path.join(sandbox, entry), "w", encoding="utf-8") as f:
+                f.write(code or "")
+
+        # Write bootstrap script
+        bootstrap_path = os.path.join(sandbox, "__runner__.py")
+        with open(bootstrap_path, "w", encoding="utf-8") as f:
+            f.write(BOOTSTRAP_TEMPLATE)
+
+        # Create input signal pipe
+        signal_r, signal_w = os.pipe()
+
+        # Set up environment
+        env = os.environ.copy()
+        env["__INPUT_SIGNAL_FD"] = str(signal_w)
+        env["__SANDBOX_DIR"] = sandbox
+        env["__ENTRYPOINT"] = entry
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        session = Session(session_id, ws, sandbox, signal_r)
+        active_sessions[session_id] = session
+        connection_sessions.setdefault(ws, set()).add(session_id)
+
+        # Configure subprocess
         kwargs = {}
         if sys.platform != "win32":
             kwargs["preexec_fn"] = _set_resource_limits
@@ -395,9 +463,9 @@ async def _run_session(
             env=env,
             **kwargs,
         )
-        os.close(signal_w)  # parent no longer needs write end
+        os.close(signal_w)  # Parent no longer needs write end
 
-        # --- tasks ---
+        # Start monitoring tasks
         dispatcher_task = asyncio.create_task(_output_dispatcher(session.queue, ws, session_id))
         stdout_task = asyncio.create_task(_stream_pipe(session.proc.stdout, session.queue, "stdout", session_id))
         stderr_task = asyncio.create_task(_stream_pipe(session.proc.stderr, session.queue, "stderr", session_id))
@@ -406,6 +474,7 @@ async def _run_session(
 
         session.tasks.extend([dispatcher_task, stdout_task, stderr_task, input_watcher_task, timeout_task])
 
+        # Wait for process completion
         await session.proc.wait()
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
@@ -421,6 +490,7 @@ async def _run_session(
 
 
 async def _handle_stdin(session_id: str, input_data: str, ws: websockets.ServerConnection):
+    """Handle stdin input from client and send to running process."""
     session = active_sessions.get(session_id)
     if not session:
         await _send_safe(ws, {"type": "error", "message": f"Session {session_id} not found."})
@@ -439,17 +509,21 @@ async def _handle_stdin(session_id: str, input_data: str, ws: websockets.ServerC
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.warning(f"Stdin write failed for {session_id}: {e}")
             await _send_safe(ws, {"type": "error", "message": "Failed to send input: process may have exited."})
+        except Exception as e:
+            logger.error(f"Unexpected stdin error for {session_id}: {e}")
+            await _send_safe(ws, {"type": "error", "message": f"Input error: {e}"})
 
 
 # ---------------------------------------------------------------------------
 # WEBSOCKET HANDLER
 # ---------------------------------------------------------------------------
 async def handler(websocket: websockets.ServerConnection):
+    """Handle WebSocket client connections and route messages."""
     logger.info("Client connected")
     try:
         async for raw_msg in websocket:
-            # size guard
-            if len(raw_msg) > MAX_TOTAL_FILE_SIZE + 10_000:
+            # Size guard - use constant instead of magic number
+            if len(raw_msg) > MAX_TOTAL_FILE_SIZE + MAX_PAYLOAD_EXTRA:
                 await _send_safe(websocket, {"type": "error", "message": "Payload too large"})
                 continue
 
@@ -467,17 +541,17 @@ async def handler(websocket: websockets.ServerConnection):
                     await _send_safe(websocket, {"type": "error", "message": "Invalid session_id"})
                     continue
 
-                # capacity guards
+                # Capacity guards (relaxed for daily use)
                 if len(active_sessions) >= MAX_CONCURRENT_SESSIONS:
                     await _send_safe(websocket, {
                         "type": "error", "session_id": session_id,
-                        "message": "Server at capacity. Try again later."
+                        "message": f"Server at capacity ({MAX_CONCURRENT_SESSIONS} sessions). Try again later."
                     })
                     continue
                 if len(connection_sessions.get(websocket, set())) >= MAX_SESSIONS_PER_WS:
                     await _send_safe(websocket, {
                         "type": "error", "session_id": session_id,
-                        "message": "Too many active sessions for this connection."
+                        "message": f"Too many active sessions ({MAX_SESSIONS_PER_WS} max)."
                     })
                     continue
 
@@ -504,6 +578,7 @@ async def handler(websocket: websockets.ServerConnection):
                     await _send_safe(websocket, {"type": "error", "message": "Provide 'code' or 'files'"})
                     continue
 
+                # Start execution in background task
                 asyncio.create_task(_run_session(files, code, entrypoint, session_id, websocket))
 
             elif msg_type == "stdin":
@@ -514,7 +589,10 @@ async def handler(websocket: websockets.ServerConnection):
 
     except websockets.exceptions.ConnectionClosed:
         logger.info("Client disconnected")
+    except Exception as e:
+        logger.error(f"Handler error: {e}")
     finally:
+        # Clean up all sessions for this connection
         for sid in list(connection_sessions.get(websocket, set())):
             if s := active_sessions.pop(sid, None):
                 await _cleanup_session(s)
@@ -529,7 +607,11 @@ async def health_check(
     path: str,
     request_headers: websockets.Headers,
 ) -> Optional[Tuple[http.HTTPStatus, List[Tuple[str, str]], bytes]]:
-    if path in ("/", "/health", "/healthz"):
+    """Handle HTTP health check requests.
+    
+    Required for Hugging Face Spaces deployment.
+    """
+    if path in HEALTH_ENDPOINTS:
         return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK"
     return None
 
@@ -538,10 +620,11 @@ async def health_check(
 # MAIN
 # ---------------------------------------------------------------------------
 async def main():
+    """Main entry point - start WebSocket server."""
     port = int(os.getenv("PORT", 7860))
     logger.info(f"Starting Python Runner on ws://0.0.0.0:{port}")
 
-    # Graceful shutdown on SIGTERM (HF Spaces sends this)
+    # Set up graceful shutdown handlers
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown()))
@@ -553,12 +636,13 @@ async def main():
         process_request=health_check,
         ping_interval=30,
         ping_timeout=60,
-        max_size=10 * 1024 * 1024,
+        max_size=MAX_WEBSOCKET_MESSAGE_SIZE,
     )
     await server.wait_closed()
 
 
 async def _shutdown():
+    """Graceful shutdown handler - clean up all active sessions."""
     logger.info("Shutdown signal received, cleaning up sessions...")
     for session in list(active_sessions.values()):
         await _cleanup_session(session)
