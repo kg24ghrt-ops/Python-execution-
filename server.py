@@ -70,6 +70,9 @@ import os, sys, builtins, importlib.abc, importlib.machinery, runpy
 
 _sandbox = os.environ.get('__SANDBOX_DIR', os.getcwd())
 _real_open = builtins.open
+_original_eval = builtins.eval
+_original_compile = builtins.compile
+_original_exec = builtins.exec
 
 # ----- Restricted file open (sandbox escape prevention) -----
 def _restricted_open(file, mode='r', *args, **kwargs):
@@ -85,13 +88,6 @@ def _restricted_open(file, mode='r', *args, **kwargs):
     return _real_open(abs_path, mode, *args, **kwargs)
 
 builtins.open = _restricted_open
-
-# ----- Disable code-evaluation builtins -----
-for _name in ('exec', 'eval', 'compile'):
-    if hasattr(builtins, _name):
-        def _make_disabled(n):
-            return lambda *a, **k: (_ for _ in ()).throw(PermissionError(n + " is disabled"))
-        setattr(builtins, _name, _make_disabled(_name))
 
 # ----- Notify server when input() is called -----
 _input_signal_fd = int(os.environ.get('__INPUT_SIGNAL_FD', -1))
@@ -110,6 +106,50 @@ def _notifying_input(prompt=''):
     return sys.stdin.readline().rstrip('\n')
 
 builtins.input = _notifying_input
+
+# ----- Disable code-evaluation builtins for user code only -----
+# We need to keep these available for Python internals, so we wrap them
+# with a check to see if they're being called from user code
+
+def _is_user_code():
+    """Check if we're executing user code (not stdlib)."""
+    import inspect
+    frame = inspect.currentframe()
+    try:
+        while frame:
+            filename = frame.f_code.co_filename
+            # Allow stdlib and runner to use eval/exec/compile
+            if '/usr/lib' in filename or '/usr/local/lib' in filename:
+                return False
+            if '__runner__' in filename:
+                return False
+            if '_restricted_open' in frame.f_code.co_name:
+                frame = frame.f_back
+                continue
+            # If we reach here, it's likely user code
+            frame = frame.f_back
+        return True
+    finally:
+        del frame
+
+def _restricted_eval(*args, **kwargs):
+    if _is_user_code():
+        raise PermissionError("eval is disabled")
+    return _original_eval(*args, **kwargs)
+
+def _restricted_compile(*args, **kwargs):
+    if _is_user_code():
+        raise PermissionError("compile is disabled")
+    return _original_compile(*args, **kwargs)
+
+def _restricted_exec(*args, **kwargs):
+    if _is_user_code():
+        raise PermissionError("exec is disabled")
+    return _original_exec(*args, **kwargs)
+
+builtins.eval = _restricted_eval
+builtins.compile = _restricted_compile
+builtins.exec = _restricted_exec
 
 # ----- Restrict os module dangerous attrs -----
 import os as _os_mod
