@@ -1,0 +1,14 @@
+{
+  "plugin": "org.smartide.plugin.editor",
+  "run": "echo 'Error in .si.json file\n/data/data/org.smartide.code/files/home/projects/python-runner/.si.json: open failed: ENOENT (No such file or directory)'",
+  "intelligence": {
+    ".py": {
+      "enabled": true,
+      "run": "pylsp"
+    },
+    ".md": {
+      "enabled": false,
+      "run": "marksman server"
+    }
+  }
+}
