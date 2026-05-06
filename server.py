@@ -7,6 +7,7 @@ with resource limits, import restrictions, and filesystem sandboxing.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import http
 import json
@@ -31,6 +32,61 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("python-runner")
+
+# AST Validation - Dangerous constructs to block before execution
+DANGEROUS_IMPORTS = {
+    'subprocess', 'socket', 'ctypes', 'multiprocessing',
+    'asyncio.subprocess', 'shutil', 'pty', 'shlex', 'os'
+}
+
+DANGEROUS_ATTRS = {
+    '__subclasses__', '__mro__', '__bases__', '__globals__', 
+    '__code__', '__func__', '__self__', '__getattribute__'
+}
+
+
+def validate_ast(code: str) -> tuple[bool, str]:
+    """Validate code AST for dangerous constructs before execution.
+    
+    Returns (True, "OK") if safe, (False, error_message) if blocked.
+    """
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            # Block dangerous imports
+            if isinstance(node, ast.ImportFrom):
+                if node.module and any(
+                    node.module == mod or node.module.startswith(mod + '.')
+                    for mod in DANGEROUS_IMPORTS
+                ):
+                    return False, f"Import of '{node.module}' is restricted"
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if any(
+                        alias.name == mod or alias.name.startswith(mod + '.')
+                        for mod in DANGEROUS_IMPORTS
+                    ):
+                        return False, f"Import of '{alias.name}' is restricted"
+            
+            # Block dangerous attribute access
+            if isinstance(node, ast.Attribute):
+                if node.attr in DANGEROUS_ATTRS:
+                    return False, f"Access to '{node.attr}' is restricted"
+            
+            # Block eval/exec calls
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in ('eval', 'exec', 'compile'):
+                    return False, f"Call to '{node.func.id}()' is restricted"
+                if isinstance(node.func, ast.Attribute) and node.func.attr in ('__call__',):
+                    # Potential exec via callable
+                    pass  # Too many false positives, skip
+        
+        return True, "OK"
+    except SyntaxError as e:
+        return False, f"Syntax error: {e}"
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
 
 # Session management limits (relaxed for daily use)
 MAX_CONCURRENT_SESSIONS = 20
@@ -66,7 +122,7 @@ SENTINEL = object()
 # BOOTSTRAP INJECTED INTO EVERY USER PROCESS
 # ---------------------------------------------------------------------------
 BOOTSTRAP_TEMPLATE = r'''
-import os, sys, builtins, importlib.abc, importlib.machinery, runpy
+import os, sys, builtins, importlib.abc, importlib.machinery, runpy, signal
 
 _sandbox = os.environ.get('__SANDBOX_DIR', os.getcwd())
 _real_open = builtins.open
@@ -150,12 +206,52 @@ class _RestrictedFinder(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, _RestrictedFinder())
 
+# ----- Block __import__ bypass -----
+_real_import = builtins.__import__
+def _restricted_import(name, *args, **kwargs):
+    if name in _dangerous_modules:
+        raise ImportError("Import of " + name + " is restricted")
+    for d in _dangerous_modules:
+        if name.startswith(d + '.'):
+            raise ImportError("Import of " + name + " is restricted")
+    return _real_import(name, *args, **kwargs)
+builtins.__import__ = _restricted_import
+
+# ----- Block eval/exec/compile -----
+def _blocked_eval(*a, **k):
+    raise RuntimeError("eval() is disabled")
+def _blocked_exec(*a, **k):
+    raise RuntimeError("exec() is disabled")
+def _blocked_compile(*a, **k):
+    raise RuntimeError("compile() is disabled")
+builtins.eval = _blocked_eval
+builtins.exec = _blocked_exec
+builtins.compile = _blocked_compile
+
+# ----- Block dangerous attribute access (__subclasses__, etc.) -----
+_object_getattr = object.__getattribute__
+def _safe_getattr(obj, name, *default):
+    if name.startswith('__') and name.endswith('__'):
+        if name in ('__subclasses__', '__mro__', '__bases__', '__globals__', '__code__', '__func__', '__self__'):
+            raise AttributeError("Access to " + name + " is restricted")
+    if default:
+        return _object_getattr(obj, name, default[0])
+    return _object_getattr(obj, name)
+builtins.getattr = _safe_getattr
+
 # ----- Audit hook (Python 3.8+) -----
 if hasattr(sys, 'addaudithook'):
     def _audit(event, args):
         if event in ('os.system', 'os.exec', 'subprocess.Popen', 'socket.__new__'):
             raise RuntimeError("Blocked by audit: " + event)
     sys.addaudithook(_audit)
+
+# ----- Hard timeout via SIGALRM (backup to setrlimit) -----
+_cpu_limit = int(os.environ.get('__CPU_LIMIT', 300))
+def _timeout_handler(sig, frame):
+    _exit(1)
+signal.signal(signal.SIGALRM, _timeout_handler)
+signal.alarm(_cpu_limit)
 
 # ----- Run user entrypoint -----
 _entrypoint = os.environ.get('__ENTRYPOINT', 'main.py')
@@ -189,9 +285,16 @@ def _set_resource_limits():
     """Set Linux resource limits for sandboxed execution.
     
     Called in child process before exec (Linux only).
+    Creates new process group so parent can kill all descendants.
     """
     try:
         import resource
+        import signal
+        
+        # Create new process group - critical for cancellation!
+        # This ensures we can kill the entire process tree with one signal
+        os.setpgrp()
+        
         resource.setrlimit(resource.RLIMIT_AS, (SANDBOX_MEMORY_BYTES, SANDBOX_MEMORY_BYTES))
         resource.setrlimit(resource.RLIMIT_CPU, (SANDBOX_CPU_SEC, SANDBOX_CPU_SEC))
         resource.setrlimit(resource.RLIMIT_NOFILE, (SANDBOX_MAX_FDS, SANDBOX_MAX_FDS))
@@ -228,10 +331,14 @@ async def _send_safe(ws: websockets.ServerConnection, payload: dict):
         pass
 
 
-async def _cleanup_session(session: Session):
+async def _cleanup_session(session: Session, killed: bool = False):
     """Clean up all resources associated with a session.
     
     Cancels tasks, terminates process, closes file descriptors, and removes sandbox.
+    
+    Args:
+        session: The session to clean up
+        killed: If True, process was already killed (don't send duplicate error)
     """
     if session.state == "CLEANING":
         return
@@ -242,12 +349,18 @@ async def _cleanup_session(session: Session):
         task.cancel()
     await asyncio.gather(*session.tasks, return_exceptions=True)
 
-    # Terminate process if still running
+    # Terminate process if still running (use process group kill)
     if session.proc and session.proc.returncode is None:
-        session.proc.terminate()
         try:
-            await asyncio.wait_for(session.proc.wait(), timeout=3.0)
-        except (asyncio.TimeoutError, ProcessLookupError):
+            # Kill entire process group to catch any grandchildren
+            pgid = os.getpgid(session.proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+            await session.proc.wait()
+        except ProcessLookupError:
+            pass  # Already dead
+        except Exception as e:
+            logger.warning(f"Process group kill failed for {session.id}: {e}")
+            # Fallback to individual kill
             session.proc.kill()
             try:
                 await session.proc.wait()
@@ -267,6 +380,60 @@ async def _cleanup_session(session: Session):
         pass
 
     session.state = "DONE"
+
+
+async def _cancel_session(session_id: str, ws: websockets.ServerConnection) -> bool:
+    """Cancel a running session by killing its process group.
+    
+    Returns True if session was found and cancelled, False otherwise.
+    Sends acknowledgment message to client.
+    """
+    session = active_sessions.get(session_id)
+    if not session:
+        await _send_safe(ws, {
+            "type": "error",
+            "session_id": session_id,
+            "message": "Session not found"
+        })
+        return False
+    
+    # Check if already finished
+    if session.proc and session.proc.returncode is not None:
+        await _send_safe(ws, {
+            "type": "error",
+            "session_id": session_id,
+            "message": "Session already completed"
+        })
+        return False
+    
+    # Kill the process group
+    if session.proc:
+        try:
+            pgid = os.getpgid(session.proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+            await session.proc.wait()
+        except ProcessLookupError:
+            pass  # Already dead
+        except Exception as e:
+            logger.error(f"Cancel kill failed for {session_id}: {e}")
+            await _send_safe(ws, {
+                "type": "error",
+                "session_id": session_id,
+                "message": f"Failed to cancel: {e}"
+            })
+            return False
+    
+    # Clean up and notify
+    await _cleanup_session(session, killed=True)
+    active_sessions.pop(session_id, None)
+    connection_sessions.get(ws, set()).discard(session_id)
+    
+    await _send_safe(ws, {
+        "type": "cancelled",
+        "session_id": session_id,
+        "message": "Execution cancelled by user"
+    })
+    return True
 
 
 async def _stream_pipe(pipe, queue: asyncio.Queue, msg_type: str, session_id: str):
@@ -441,6 +608,7 @@ async def _run_session(
         env["__INPUT_SIGNAL_FD"] = str(signal_w)
         env["__SANDBOX_DIR"] = sandbox
         env["__ENTRYPOINT"] = entry
+        env["__CPU_LIMIT"] = str(SANDBOX_CPU_SEC)  # For SIGALRM timeout in bootstrap
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
 
@@ -574,6 +742,15 @@ async def handler(websocket: websockets.ServerConnection):
                     if len(code) > MAX_TOTAL_FILE_SIZE:
                         await _send_safe(websocket, {"type": "error", "message": "Code size exceeds limit"})
                         continue
+                    # AST validation for single-file code
+                    is_valid, validation_msg = validate_ast(code)
+                    if not is_valid:
+                        await _send_safe(websocket, {
+                            "type": "error",
+                            "session_id": session_id,
+                            "message": f"Code validation failed: {validation_msg}"
+                        })
+                        continue
                 else:
                     await _send_safe(websocket, {"type": "error", "message": "Provide 'code' or 'files'"})
                     continue
@@ -583,6 +760,12 @@ async def handler(websocket: websockets.ServerConnection):
 
             elif msg_type == "stdin":
                 await _handle_stdin(session_id, msg.get("input", ""), websocket)
+
+            elif msg_type == "cancel":
+                if not _sanitize_session_id(session_id):
+                    await _send_safe(websocket, {"type": "error", "message": "Invalid session_id"})
+                    continue
+                await _cancel_session(session_id, websocket)
 
             else:
                 await _send_safe(websocket, {"type": "error", "message": f"Unknown type: {msg_type}"})
@@ -634,8 +817,9 @@ async def main():
         host="0.0.0.0",
         port=port,
         process_request=health_check,
-        ping_interval=30,
-        ping_timeout=60,
+        ping_interval=20,  # Faster dead connection detection
+        ping_timeout=30,   # Reduced from 60 for quicker cleanup
+        close_timeout=5,   # Fast cleanup on disconnect
         max_size=MAX_WEBSOCKET_MESSAGE_SIZE,
     )
     await server.wait_closed()
