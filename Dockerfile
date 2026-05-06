@@ -1,5 +1,5 @@
-# Use official slim Python image for minimal footprint
-FROM python:3.11-slim
+# Use official Alpine Python image for minimal footprint (~50MB vs ~120MB slim)
+FROM python:3.11-alpine
 
 # Set working directory
 WORKDIR /app
