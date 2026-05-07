@@ -68,8 +68,11 @@ SENTINEL = object()
 BOOTSTRAP_TEMPLATE = r'''
 import os, sys, builtins, importlib.abc, importlib.machinery, runpy
 
-_sandbox = os.environ.get('__SANDBOX_DIR', os.getcwd())
+# Save original builtins functions before any modifications
 _real_open = builtins.open
+_real_getattr = builtins.getattr
+
+_sandbox = os.environ.get('__SANDBOX_DIR', os.getcwd())
 
 # ----- Restricted file open (sandbox escape prevention) -----
 def _restricted_open(file, mode='r', *args, **kwargs):
